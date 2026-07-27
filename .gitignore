@@ -46,6 +46,13 @@ obsidian/Без названия*.md
 .vscode/
 *.swp
 
+# Obsidian vault (проект лежит внутри хранилища)
+.obsidian/
+
+# Личный ресёрч, не часть продукта
+singularity/research_singularity.md
+
+
 # --- Windows ---
 Thumbs.db
 desktop.ini
