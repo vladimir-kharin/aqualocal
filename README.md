@@ -14,6 +14,12 @@
 
 ---
 
+## Демо
+
+Видео с демонстрацией работы: [YouTube](https://youtu.be/RJjDCePVZ0s) · [зеркало на Яндекс.Диске](https://disk.yandex.ru/i/apnp1_Zxa5f5Og)
+
+---
+
 ## Как это работает
 
 ```
