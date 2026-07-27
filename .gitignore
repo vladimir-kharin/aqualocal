@@ -1,0 +1,67 @@
+# --- Секреты ---
+.env
+*.env
+!.env.example
+
+# --- Виртуальное окружение ---
+.venv/
+venv/
+env/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Логи и рантайм ---
+*.log
+aqualocal.log
+singularity/queue.jsonl
+obsidian/queue.jsonl
+
+# --- Личные данные пользователя (НЕ публиковать) ---
+# Кэш проектов/тегов и алиасы содержат названия личных проектов и их ID.
+singularity/cache.json
+singularity/aliases.json
+
+# --- Выгруженная спека API (перезаписывается скриптом fetch_openapi.py) ---
+singularity/openapi.json
+singularity/openapi_raw.txt
+
+# --- Черновики и заметки разработки ---
+Без названия*.md
+singularity/Без названия*.md
+obsidian/Без названия*.md
+
+# --- IDE ---
+.idea/
+.vscode/
+*.swp
+
+# --- Windows ---
+Thumbs.db
+desktop.ini
+
+# --- Бэкапы и мусор ---
+*.bak
+*.orig
+*.tmp
+
+# --- Старые версии и черновики (остаются локально, в репо не нужны) ---
+# В корне только app.py — остальные app*.py это черновики прошлых итераций.
+/app_*.py
+/app1.py
+/app3.py
+/test_cuda_2.py
+/Реализация/
+/плашка
+/2*
+/dr3fd34
