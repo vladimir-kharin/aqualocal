@@ -59,7 +59,7 @@ CPU-режим технически возможен (правкой `device="cp
 ## Быстрый старт
 
 ```powershell
-git clone https://github.com/<你>/aqualocal.git
+git clone https://github.com/neo-flashman/aqualocal.git
 cd aqualocal
 
 py -3.12 -m venv .venv
