@@ -79,6 +79,7 @@ setup_nvidia_paths()
 
 import queue
 
+import io
 import math
 import time
 import tkinter as tk
@@ -87,8 +88,10 @@ import numpy as np
 import sounddevice as sd
 import keyboard
 import pyperclip
-import winsound
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from faster_whisper import WhisperModel
+from faster_whisper.audio import decode_audio
+from faster_whisper.vad import get_speech_timestamps, VadOptions
 import pystray
 from PIL import Image, ImageDraw
 
@@ -149,9 +152,6 @@ HOTKEYS = dict(sorted(HOTKEYS.items(), key=lambda kv: kv[0].count('+'), reverse=
 # Тег, которым помечается дубль задачи в дневнике (F20).
 TASK_NOTE_TAG = (ENV.get('OBS_TASK_TAG', '') or 'задача').strip()
 
-# Тон старта записи — чтобы на слух понимать, какой режим сработал
-START_TONE = {MODE_INSERT: 1000, MODE_TASK: 1400, MODE_NOTE: 1800}
-
 SAMPLE_RATE = 16000
 MODEL_SIZE = "large-v3"
 LANGUAGE = "ru"
@@ -162,6 +162,20 @@ app_running = True
 current_volume = 0.0        # Для анимации
 current_mode = MODE_INSERT  # Режим текущей записи (определяет цвет оверлея)
 flash_queue = queue.Queue()  # Сообщения для подтверждающей плашки (worker -> UI)
+
+# Идёт распознавание: оверлей показывает статус вместо волны. Звуковых сигналов
+# в программе нет — вся обратная связь визуальная, через плашку оверлея.
+is_transcribing = False
+transcribe_started = 0.0    # момент старта — для счётчика секунд в статусе
+
+# Модель одна на всех: микрофон (хоткеи) и локальный STT-сервер ходят к ней
+# по очереди, иначе два transcribe разом дерутся за видеопамять.
+model_lock = threading.Lock()
+
+
+def flash(text, ok=True, sec=None):
+    """Показать плашку в оверлее (из рабочего потока). sec — сколько держать."""
+    flash_queue.put((text, ok, sec))
 
 # Отправщик в SingularityApp. Если модуля нет или он не импортируется,
 # задачи копятся в singularity/queue.jsonl и не теряются.
@@ -257,19 +271,16 @@ def handle_task(text):
         try:
             summary = send_task(text)
             logging.info(f"Задача отправлена в SingularityApp: {summary}")
-            flash_queue.put((summary, True))
-            winsound.Beep(1600, 120)
+            flash(summary, True)
             return
         except Exception as e:
             logging.error(f"Ошибка отправки в SingularityApp: {e}")
             enqueue_task(text, reason=str(e))
-            flash_queue.put((f"в очередь: {text}", False))
-            winsound.Beep(400, 250)
+            flash(f"в очередь: {text}", False)
             return
 
     enqueue_task(text, reason="sender не подключён")
-    flash_queue.put((f"в очередь: {text}", True))
-    winsound.Beep(1600, 120)
+    flash(f"в очередь: {text}", True)
 
 
 def enqueue_note_fallback(text, reason="", extra_tags=None):
@@ -295,19 +306,79 @@ def handle_note(text):
         try:
             summary = append_note(text)
             logging.info(f"Заметка записана в Obsidian: {summary}")
-            flash_queue.put((summary, True))
-            winsound.Beep(2000, 120)
+            flash(summary, True)
             return
         except Exception as e:
             logging.error(f"Ошибка записи в Obsidian: {e}")
             (enqueue_note or enqueue_note_fallback)(text, reason=str(e))
-            flash_queue.put((f"в очередь: {text}", False))
-            winsound.Beep(400, 250)
+            flash(f"в очередь: {text}", False)
             return
 
     enqueue_note_fallback(text, reason="writer не подключён")
-    flash_queue.put((f"в очередь: {text}", True))
-    winsound.Beep(2000, 120)
+    flash(f"в очередь: {text}", True)
+
+
+# ================= 2.6 ЛОКАЛЬНЫЙ STT-СЕРВЕР =================
+# Отдаёт распознавание другим программам на этой машине: POST /stt с телом-аудио
+# → {"text": "..."}. Формат любой, какой понимает PyAV (ogg/opus из Telegram,
+# mp3, wav) — перекодировать снаружи не надо. Модель уже в видеопамяти, второй
+# копии не появляется. Выключен, пока в .env не задан STT_PORT.
+def start_stt_server(recognize):
+    try:
+        port = int((ENV.get('STT_PORT', '') or '0').strip())
+    except ValueError:
+        port = 0
+    if not port:
+        logging.info("STT_PORT не задан — локальный сервер распознавания выключен.")
+        return
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+
+        def do_POST(self):
+            if self.path.rstrip('/') != '/stt':
+                self.send_error(404)
+                return
+            size = int(self.headers.get('Content-Length') or 0)
+            data = self.rfile.read(size) if size else b''
+            if not data:
+                self.send_error(400, 'empty body')
+                return
+
+            started = time.time()
+            try:
+                audio = decode_audio(io.BytesIO(data), sampling_rate=SAMPLE_RATE)
+                # Речи нет — модель не трогаем, отвечаем пустым текстом.
+                if get_speech_timestamps(audio, VadOptions(min_silence_duration_ms=500)):
+                    text = recognize(audio)
+                else:
+                    text = ''
+                logging.info(f"[stt] {len(audio) / SAMPLE_RATE:.1f} сек аудио за "
+                             f"{time.time() - started:.1f} с: {text or '(речи нет)'}")
+                self._reply(200, {"text": text})
+            except Exception as e:
+                logging.error(f"STT-сервер: {e}", exc_info=True)
+                self._reply(500, {"error": str(e)})
+
+        def _reply(self, code, payload):
+            body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+            self.send_response(code)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass        # у pythonw нет stderr, лог ведём сами
+
+    try:
+        srv = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+    except Exception as e:
+        logging.error(f"STT-сервер не поднялся на порту {port}: {e}")
+        return
+
+    threading.Thread(target=srv.serve_forever, name="stt_server", daemon=True).start()
+    logging.info(f"STT-сервер слушает 127.0.0.1:{port} (POST /stt).")
 
 
 # ================= 3. РАБОЧИЙ ПОТОК (STT) =================
@@ -335,30 +406,53 @@ def stt_worker():
         loaded.set()
         hk = ", ".join(f"{k.upper()}={v}" for k, v in HOTKEYS.items())
         logging.info(f"Модель успешно загружена! Хоткеи: {hk}")
-        winsound.Beep(1200, 150)  # Сигнал готовности к работе
+        flash("AquaLocal готов", True, 1.5)  # видимый признак готовности вместо сигнала
     except Exception as e:
         loaded.set()
         logging.critical(f"Ошибка загрузки модели (скорее всего проблема с CUDA/cuDNN): {e}",
                          exc_info=True)
         return
 
-    def process_audio(mode):
-        audio_data = []
-        while not audio_queue.empty():
-            audio_data.append(audio_queue.get())
-        if not audio_data:
-            return
-
-        audio_np = np.concatenate(audio_data, axis=0).flatten().astype(np.float32)
-        try:
+    def recognize(audio):
+        """Массив float32 16 кГц → текст. Обращение к модели сериализовано замком:
+        микрофон и локальный STT-сервер не должны запускать transcribe разом."""
+        with model_lock:
             segments, _ = model.transcribe(
-                audio_np,
+                audio,
                 beam_size=1,
                 language=LANGUAGE,
                 vad_filter=True,
                 vad_parameters=dict(min_silence_duration_ms=500)
             )
-            text = " ".join([s.text.strip() for s in segments]).strip()
+            return " ".join(s.text.strip() for s in segments).strip()
+
+    start_stt_server(recognize)
+
+    def process_audio(mode):
+        global is_transcribing, transcribe_started
+
+        audio_data = []
+        while not audio_queue.empty():
+            audio_data.append(audio_queue.get())
+        if not audio_data:
+            flash("не расслышал", False, 1.0)
+            return
+
+        audio_np = np.concatenate(audio_data, axis=0).flatten().astype(np.float32)
+
+        # Речи нет — модель на видеокарте не будим. Детектор Silero (он же
+        # используется внутри Whisper) отрабатывает на процессоре за 10–20 мс
+        # и, в отличие от порога громкости, не принимает шум за речь.
+        if not get_speech_timestamps(audio_np, VadOptions(min_silence_duration_ms=500)):
+            logging.info(f"[{mode}] Речи не найдено ({len(audio_np) / SAMPLE_RATE:.1f} сек) — Whisper не запускался.")
+            flash("не расслышал", False, 1.0)
+            return
+
+        is_transcribing = True          # оверлей покажет статус вместо волны
+        transcribe_started = time.time()
+        try:
+            text = recognize(audio_np)
+            is_transcribing = False     # дальше говорят плашки подтверждения
 
             if text:
                 logging.info(f"[{mode}] Распознано ({len(audio_np) / SAMPLE_RATE:.1f} сек аудио): {text}")
@@ -370,9 +464,12 @@ def stt_worker():
                     insert_at_cursor(text)
             else:
                 logging.info("Распознана тишина (отброшено VAD).")
-                winsound.Beep(400, 150)  # Звук ошибки распознавания
+                flash("не расслышал", False, 1.0)
         except Exception as e:
             logging.error(f"Ошибка транскрибации: {e}", exc_info=True)
+            flash("ошибка распознавания", False)
+        finally:
+            is_transcribing = False
 
     # Бесконечный цикл перезапуска микрофона (Защита от сбоев)
     while app_running:
@@ -396,7 +493,6 @@ def stt_worker():
                             audio_queue.get()
 
                         is_recording = True
-                        winsound.Beep(START_TONE.get(mode, 1000), 100)
 
                         # Цикл удержания клавиши
                         while keyboard.is_pressed(key) and app_running:
@@ -404,7 +500,6 @@ def stt_worker():
 
                         # Отпускание клавиши
                         is_recording = False
-                        winsound.Beep(800, 100)  # Звук стопа
                         process_audio(mode)
 
                     time.sleep(0.05)
@@ -518,6 +613,25 @@ class RecordingOverlay:
         c.create_text(42, self.H / 2, text=txt, anchor='w',
                       font=('Segoe UI', 10), fill='#212121')
 
+    def _redraw_status(self):
+        """Запись кончилась, работает Whisper: точка + «идёт распознавание».
+
+        Точки бегут, чтобы было видно, что процесс жив; если распознавание
+        затянулось (VRAM занята, длинная фраза) — добавляется счётчик секунд.
+        """
+        c = self.canvas
+        c.delete('all')
+        self._draw_pill()
+        c.create_oval(20, self.H / 2 - 6, 32, self.H / 2 + 6, fill=self.accent(), outline='')
+
+        waited = time.time() - transcribe_started
+        txt = 'идёт распознавание'
+        if waited > 3:
+            txt += f' {int(waited)} с'
+        txt += '.' * (int(time.time() * 2) % 4)
+        c.create_text(42, self.H / 2, text=txt, anchor='w',
+                      font=('Segoe UI', 10), fill='#212121')
+
     def _tick(self):
         if not app_running:
             return
@@ -525,9 +639,9 @@ class RecordingOverlay:
         # забираем подтверждения из рабочего потока
         try:
             while True:
-                text, ok = flash_queue.get_nowait()
+                text, ok, sec = flash_queue.get_nowait()
                 self.flash_text, self.flash_ok = text, ok
-                self.flash_until = time.time() + self.FLASH_SEC
+                self.flash_until = time.time() + (sec or self.FLASH_SEC)
         except queue.Empty:
             pass
 
@@ -540,6 +654,12 @@ class RecordingOverlay:
             self.history.pop(0)
             self.history.append(min(1.0, current_volume * 14))
             self._redraw()
+        elif is_transcribing:
+            self.flash_until = 0.0
+            if not self.shown:
+                self.root.attributes('-alpha', 0.97)
+                self.shown = True
+            self._redraw_status()
         elif time.time() < self.flash_until:
             if not self.shown:
                 self.root.attributes('-alpha', 0.97)
