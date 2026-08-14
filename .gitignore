@@ -32,6 +32,9 @@ obsidian/queue.jsonl
 singularity/cache.json
 singularity/aliases.json
 
+# История распознаваний: записи голоса и расшифровки последних фраз.
+history/
+
 # --- Выгруженная спека API (перезаписывается скриптом fetch_openapi.py) ---
 singularity/openapi.json
 singularity/openapi_raw.txt

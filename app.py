@@ -162,6 +162,12 @@ app_running = True
 current_volume = 0.0        # Для анимации
 current_mode = MODE_INSERT  # Режим текущей записи (определяет цвет оверлея)
 flash_queue = queue.Queue()  # Сообщения для подтверждающей плашки (worker -> UI)
+ui_queue = queue.Queue()     # Команды главному потоку (трей -> UI): виджеты tkinter
+                             # можно трогать только из потока mainloop
+
+# Ссылка на распознаватель для окна истории. Ставится в stt_worker, когда модель
+# загружена: до этого повторное распознавание невозможно.
+recognize_fn = None
 
 # Идёт распознавание: оверлей показывает статус вместо волны. Звуковых сигналов
 # в программе нет — вся обратная связь визуальная, через плашку оверлея.
@@ -196,6 +202,19 @@ except Exception as _e:
     append_note = None
     enqueue_note = None
     logging.warning(f"obsidian.writer недоступен ({_e}) — режим F21 пишет в локальную очередь.")
+
+# История распознаваний: аудио + текст последних фраз. Не критична для работы —
+# если модуль не подключился, приложение продолжает работать без истории.
+try:
+    import history_store
+    from history_window import HistoryWindow
+
+    logging.info(f"История распознаваний: {history_store.DIR} "
+                 f"(храним {history_store.KEEP}, включена: {history_store.ENABLED})")
+except Exception as _e:
+    history_store = None
+    HistoryWindow = None
+    logging.warning(f"Модуль истории недоступен ({_e}) — фрагменты не сохраняются.")
 
 
 # Разобранные хоткеи: имя из .env -> список групп скан-кодов. Группа — варианты
@@ -434,7 +453,7 @@ def start_stt_server(recognize):
 
 # ================= 3. РАБОЧИЙ ПОТОК (STT) =================
 def stt_worker():
-    global is_recording, current_mode
+    global is_recording, current_mode, recognize_fn
 
     logging.info(f"Загрузка модели {MODEL_SIZE} в VRAM (FP16)...")
 
@@ -477,6 +496,7 @@ def stt_worker():
             )
             return " ".join(s.text.strip() for s in segments).strip()
 
+    recognize_fn = recognize        # окно истории распознаёт сохранённое аудио тем же вызовом
     start_stt_server(recognize)
 
     def process_audio(mode):
@@ -491,11 +511,18 @@ def stt_worker():
 
         audio_np = np.concatenate(audio_data, axis=0).flatten().astype(np.float32)
 
+        # Аудио уходит в историю ДО распознавания: если Whisper упадёт или VAD
+        # съест фразу, фрагмент всё равно можно будет переслушать и распознать
+        # заново из окна истории.
+        rec_id = history_store.save(audio_np, SAMPLE_RATE, mode) if history_store else None
+
         # Речи нет — модель на видеокарте не будим. Детектор Silero (он же
         # используется внутри Whisper) отрабатывает на процессоре за 10–20 мс
         # и, в отличие от порога громкости, не принимает шум за речь.
         if not get_speech_timestamps(audio_np, VadOptions(min_silence_duration_ms=500)):
             logging.info(f"[{mode}] Речи не найдено ({len(audio_np) / SAMPLE_RATE:.1f} сек) — Whisper не запускался.")
+            if history_store:
+                history_store.update(rec_id, status=history_store.STATUS_NO_SPEECH)
             flash("не расслышал", False, 1.0)
             return
 
@@ -504,6 +531,11 @@ def stt_worker():
         try:
             text = recognize(audio_np)
             is_transcribing = False     # дальше говорят плашки подтверждения
+
+            if history_store:
+                history_store.update(
+                    rec_id, text=text,
+                    status=history_store.STATUS_DONE if text else history_store.STATUS_NO_SPEECH)
 
             if text:
                 logging.info(f"[{mode}] Распознано ({len(audio_np) / SAMPLE_RATE:.1f} сек аудио): {text}")
@@ -518,6 +550,8 @@ def stt_worker():
                 flash("не расслышал", False, 1.0)
         except Exception as e:
             logging.error(f"Ошибка транскрибации: {e}", exc_info=True)
+            if history_store:
+                history_store.update(rec_id, status=history_store.STATUS_ERROR)
             flash("ошибка распознавания", False)
         finally:
             is_transcribing = False
@@ -738,9 +772,24 @@ class RecordingOverlay:
         c.create_text(42, self.H / 2, text=txt, anchor='w',
                       font=('Segoe UI', 10), fill='#212121')
 
+    def _handle_ui_commands(self):
+        """Команды из трея. Трей живёт в своём потоке, а окна tkinter можно
+        создавать только здесь, в потоке mainloop."""
+        try:
+            while True:
+                cmd = ui_queue.get_nowait()
+                if cmd == 'history' and HistoryWindow is not None:
+                    HistoryWindow.open(self.root, recognize_fn)
+        except queue.Empty:
+            pass
+        except Exception as e:
+            logging.error(f"Не удалось открыть окно истории: {e}", exc_info=True)
+
     def _tick(self):
         if not app_running:
             return
+
+        self._handle_ui_commands()
 
         # забираем подтверждения из рабочего потока
         try:
@@ -782,6 +831,11 @@ def create_image():
     return image
 
 
+def history_action(icon, item):
+    """Пункт трея «История…»: просим главный поток открыть окно."""
+    ui_queue.put('history')
+
+
 def exit_action(icon, item):
     global app_running
     logging.info("Пользователь запросил выход через трей. Завершение работы...")
@@ -809,6 +863,7 @@ try:
         pystray.MenuItem(f"{_key_for(MODE_INSERT)} — вставить в курсор", lambda: None, enabled=False),
         pystray.MenuItem(f"{_key_for(MODE_TASK)} — задача в SingularityApp", lambda: None, enabled=False),
         pystray.MenuItem(f"{_key_for(MODE_NOTE)} — заметка в Obsidian", lambda: None, enabled=False),
+        pystray.MenuItem("История…", history_action, enabled=HistoryWindow is not None),
         pystray.MenuItem("Выход", exit_action)
     )
     icon = pystray.Icon("AquaLocal", create_image(), "AquaLocal STT", menu)
