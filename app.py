@@ -510,6 +510,26 @@ def stt_worker():
 
 
 # ================= 3.5 ВИЗУАЛИЗАЦИЯ (ОВЕРЛЕЙ ЗАПИСИ) =================
+# WinAPI для оверлея. Прототипы задаём явно: по умолчанию ctypes считает аргументы
+# 32-битными и на 64-битной Windows может обрезать хендл окна.
+_user32 = ctypes.windll.user32
+_user32.GetParent.restype = ctypes.c_void_p
+_user32.GetParent.argtypes = [ctypes.c_void_p]
+_user32.GetWindowLongW.restype = ctypes.c_long
+_user32.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_user32.SetWindowLongW.restype = ctypes.c_long
+_user32.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+_user32.SetWindowPos.restype = ctypes.c_bool
+_user32.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                 ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                 ctypes.c_uint]
+
+HWND_TOPMOST = ctypes.c_void_p(-1)   # «поверх всех» в SetWindowPos
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+
+
 class RecordingOverlay:
     """Белая плашка внизу экрана: мигающая точка + волны, реагирующие на звук.
 
@@ -526,6 +546,7 @@ class RecordingOverlay:
     GREY = '#9e9e9e'
     TRANS = '#0f0f0f'  # "прозрачный" цвет (не должен встречаться в рисунке)
     FLASH_SEC = 1.8    # сколько держим подтверждающую плашку
+    TOPMOST_EVERY = 15  # переутверждать «поверх всех» раз в 15 кадров (~0.5 с)
 
     def __init__(self, root):
         self.root = root
@@ -547,6 +568,8 @@ class RecordingOverlay:
         self.flash_text = None
         self.flash_until = 0.0
         self.flash_ok = True
+        self.hwnd = None            # хендл окна плашки, заполняется в _make_clickthrough
+        self.topmost_ticks = 0      # счётчик кадров до следующего переутверждения topmost
 
         root.update_idletasks()
         self._make_clickthrough()
@@ -563,13 +586,45 @@ class RecordingOverlay:
             WS_EX_NOACTIVATE = 0x08000000
             WS_EX_TOOLWINDOW = 0x00000080
             WS_EX_TRANSPARENT = 0x00000020
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            ctypes.windll.user32.SetWindowLongW(
-                hwnd, GWL_EXSTYLE,
+            self.hwnd = _user32.GetParent(self.root.winfo_id())
+            style = _user32.GetWindowLongW(self.hwnd, GWL_EXSTYLE)
+            _user32.SetWindowLongW(
+                self.hwnd, GWL_EXSTYLE,
                 style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT)
         except Exception as e:
             logging.error(f"Не удалось сделать оверлей click-through: {e}")
+
+    def _reassert_topmost(self):
+        """Возвращает плашку в самый верх z-порядка.
+
+        Флага `-topmost` при создании мало: Windows отдаёт верх последнему, кто
+        заявил topmost, поэтому плеер, конференция или полноэкранный браузер
+        перекрывают плашку. SWP_NOACTIVATE обязателен — иначе окно утащит фокус
+        из приложения, куда идёт диктовка. Если плашка уже сверху, вызов ничего
+        не перерисовывает, мигания нет.
+        """
+        if not self.hwnd:
+            return
+        try:
+            _user32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        except Exception as e:
+            logging.error(f"Не удалось поднять оверлей поверх окон: {e}")
+
+    def _show(self):
+        """Показывает плашку (или удерживает показанную) поверх остальных окон."""
+        if not self.shown:
+            self._reassert_topmost()
+            self.topmost_ticks = 0
+            self.root.attributes('-alpha', 0.97)
+            self.shown = True
+            return
+        # пока плашка видна, периодически возвращаем её наверх: чужое окно могло
+        # объявить себя topmost уже после нас
+        self.topmost_ticks += 1
+        if self.topmost_ticks >= self.TOPMOST_EVERY:
+            self.topmost_ticks = 0
+            self._reassert_topmost()
 
     def _draw_pill(self):
         c, w, h = self.canvas, self.W, self.H
@@ -647,23 +702,17 @@ class RecordingOverlay:
 
         if is_recording:
             self.flash_until = 0.0
-            if not self.shown:
-                self.root.attributes('-alpha', 0.97)
-                self.shown = True
+            self._show()
             # сдвигаем волну влево, добавляем текущую громкость
             self.history.pop(0)
             self.history.append(min(1.0, current_volume * 14))
             self._redraw()
         elif is_transcribing:
             self.flash_until = 0.0
-            if not self.shown:
-                self.root.attributes('-alpha', 0.97)
-                self.shown = True
+            self._show()
             self._redraw_status()
         elif time.time() < self.flash_until:
-            if not self.shown:
-                self.root.attributes('-alpha', 0.97)
-                self.shown = True
+            self._show()
             self._redraw_flash()
         elif self.shown:
             self.root.attributes('-alpha', 0.0)
