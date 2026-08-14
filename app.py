@@ -198,6 +198,57 @@ except Exception as _e:
     logging.warning(f"obsidian.writer недоступен ({_e}) — режим F21 пишет в локальную очередь.")
 
 
+# Разобранные хоткеи: имя из .env -> список групп скан-кодов. Группа — варианты
+# одной клавиши (у Ctrl их три: левый, правый, расширенный).
+_hotkey_codes = {}
+_hotkey_retry_at = {}
+_hotkey_warned_at = {}
+
+
+def hotkey_codes(name):
+    """Скан-коды хоткея; None, если разобрать не удалось.
+
+    Имена символьных клавиш ('`', ';', '[') keyboard резолвит через **активную
+    раскладку**: при русской раскладке обратного апострофа в ней нет, и разбор
+    падает с «Key '`' is not mapped to any known key». Скан-коды от раскладки не
+    зависят, поэтому разбираем имя один раз и дальше проверяем нажатие по кодам.
+    Если в момент старта раскладка неподходящая — пробуем снова раз в 2 секунды,
+    пока пользователь не переключится.
+    """
+    codes = _hotkey_codes.get(name)
+    if codes is not None:
+        return codes
+    if time.time() < _hotkey_retry_at.get(name, 0.0):
+        return None
+    try:
+        codes = [combo for step in keyboard.parse_hotkey(name) for combo in step]
+        _hotkey_codes[name] = codes
+        logging.info(f"Хоткей {name.upper()} разобран в скан-коды: {codes}")
+        return codes
+    except Exception as e:
+        now = time.time()
+        _hotkey_retry_at[name] = now + 2.0
+        # предупреждаем раз в минуту: пробуем-то каждые 2 секунды
+        if now - _hotkey_warned_at.get(name, 0.0) > 60:
+            _hotkey_warned_at[name] = now
+            logging.warning(f"Хоткей {name.upper()} пока не разобрать ({e}). "
+                            f"Обычно это значит, что символьная клавиша есть только в латинской "
+                            f"раскладке — переключи раскладку, хоткей подхватится сам.")
+        return None
+
+
+def hotkey_pressed(name):
+    """Нажат ли хоткей целиком (все части одновременно)."""
+    codes = hotkey_codes(name)
+    if not codes:
+        return False
+    try:
+        return all(any(keyboard.is_pressed(sc) for sc in group) for group in codes)
+    except Exception as e:
+        logging.error(f"Проверка хоткея {name.upper()} не удалась: {e}")
+        return False
+
+
 def audio_callback(indata, frames, time_info, status):
     global current_volume
     if status:
@@ -480,7 +531,7 @@ def stt_worker():
                 while app_running:
                     pressed = None
                     for key, mode in HOTKEYS.items():
-                        if keyboard.is_pressed(key):
+                        if hotkey_pressed(key):
                             pressed = (key, mode)
                             break
 
@@ -495,7 +546,7 @@ def stt_worker():
                         is_recording = True
 
                         # Цикл удержания клавиши
-                        while keyboard.is_pressed(key) and app_running:
+                        while hotkey_pressed(key) and app_running:
                             time.sleep(0.01)
 
                         # Отпускание клавиши
