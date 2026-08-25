@@ -311,6 +311,85 @@ def hotkey_pressed(name):
         return False
 
 
+# ================= 2.4 ВЫБОР МИКРОФОНА =================
+# Устройство выбирается в трее и живёт до перезапуска: при старте всегда берётся
+# системное по умолчанию. Флаги ниже ставит поток трея, а читает рабочий поток —
+# присваивание атомарно, отдельная очередь тут не нужна.
+audio_device = None        # имя выбранного микрофона; None — системный по умолчанию
+audio_device_active = ""   # на каком микрофоне поток открыт на самом деле
+audio_devices = []         # имена для меню; обновляются при каждом открытии потока
+audio_restart = False      # просьба переоткрыть поток (сменили устройство)
+audio_rescan = False       # просьба перечитать список устройств у PortAudio
+
+
+def input_devices():
+    """Имена микрофонов того же host API, что и устройство по умолчанию.
+
+    Windows показывает каждую железку отдельно в MME, WASAPI и DirectSound —
+    если брать все, список в меню вырастет вчетверо. Берём тот API, который
+    используется при device=None, иначе выбор в меню разойдётся с поведением
+    по умолчанию.
+    """
+    names = []
+    try:
+        api = sd.default.hostapi
+        for dev in sd.query_devices():
+            name = dev['name'].strip()
+            if dev['max_input_channels'] > 0 and dev['hostapi'] == api and name:
+                if name not in names:
+                    names.append(name)
+    except Exception as e:
+        logging.error(f"Не удалось получить список микрофонов: {e}")
+    return names
+
+
+def device_index(name):
+    """Индекс устройства по имени; None — системный по умолчанию.
+
+    Ищем каждый раз заново: индексы съезжают, стоит воткнуть или вынуть железку.
+    """
+    if not name:
+        return None
+    try:
+        api = sd.default.hostapi
+        for i, dev in enumerate(sd.query_devices()):
+            if (dev['max_input_channels'] > 0 and dev['hostapi'] == api
+                    and dev['name'].strip() == name):
+                return i
+    except Exception as e:
+        logging.error(f"Не удалось найти микрофон «{name}»: {e}")
+        return None
+    logging.warning(f"Микрофон «{name}» не найден — берём системный по умолчанию.")
+    return None
+
+
+def stream_device_name(stream):
+    """Имя устройства, на котором поток открыт в действительности."""
+    try:
+        dev = stream.device
+        if isinstance(dev, (tuple, list)):
+            dev = dev[0]
+        return sd.query_devices(dev)['name'].strip()
+    except Exception as e:
+        logging.error(f"Не удалось определить активный микрофон: {e}")
+        return ""
+
+
+def rescan_devices():
+    """Заставить PortAudio перечитать список устройств.
+
+    Железо PortAudio запоминает при инициализации, поэтому микрофон, включённый
+    после старта приложения, сам по себе в списке не появится. Вызывать можно
+    только при закрытом потоке — иначе оборвём запись.
+    """
+    try:
+        sd._terminate()
+        sd._initialize()
+        logging.info("Список аудиоустройств перечитан.")
+    except Exception as e:
+        logging.error(f"Не удалось перечитать список устройств: {e}")
+
+
 def audio_callback(indata, frames, time_info, status):
     global current_volume
     if status:
@@ -497,6 +576,7 @@ def start_stt_server(recognize):
 # ================= 3. РАБОЧИЙ ПОТОК (STT) =================
 def stt_worker():
     global is_recording, current_mode, recognize_fn
+    global audio_device_active, audio_devices, audio_restart, audio_rescan
 
     logging.info(f"Загрузка модели {MODEL_SIZE} в VRAM (FP16)...")
 
@@ -600,12 +680,33 @@ def stt_worker():
             is_transcribing = False
 
     # Бесконечный цикл перезапуска микрофона (Защита от сбоев)
+    announce = False   # показать плашку после переоткрытия по команде из трея
     while app_running:
         try:
-            with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32', callback=audio_callback):
-                logging.info("Аудио-поток (InputStream) успешно открыт. Хоткеи слушаются.")
+            if audio_rescan:
+                audio_rescan = False
+                rescan_devices()
+
+            with sd.InputStream(device=device_index(audio_device), samplerate=SAMPLE_RATE,
+                                channels=1, dtype='float32', callback=audio_callback) as stream:
+                audio_device_active = stream_device_name(stream)
+                audio_devices = input_devices()
+                refresh_tray()
+                logging.info(f"Аудио-поток (InputStream) успешно открыт: "
+                             f"{audio_device_active or 'устройство неизвестно'}. Хоткеи слушаются.")
+                if announce:
+                    announce = False
+                    flash(f"микрофон: {audio_device_active}", True, 1.5)
 
                 while app_running:
+                    # Смену устройства выполняем между фразами: пока клавиша зажата,
+                    # мы всё равно крутимся во внутреннем цикле и сюда не заходим.
+                    if audio_restart and not is_recording:
+                        audio_restart = False
+                        announce = True
+                        logging.info("Переключение микрофона — закрываем поток.")
+                        break
+
                     pressed = None
                     for key, mode in HOTKEYS.items():
                         if hotkey_pressed(key):
@@ -879,6 +980,56 @@ def history_action(icon, item):
     ui_queue.put('history')
 
 
+# Иконка трея. Нужна рабочему потоку: список микрофонов он узнаёт только при
+# открытии потока, а меню на Windows строится один раз и кешируется — без
+# update_menu() свежий список в нём не появится.
+tray_icon = None
+
+
+def refresh_tray():
+    """Пересобрать меню трея (список микрофонов и отметки могли измениться)."""
+    if tray_icon is None:
+        return
+    try:
+        tray_icon.update_menu()
+    except Exception as e:
+        logging.error(f"Не удалось обновить меню трея: {e}")
+
+
+def pick_device(name):
+    """Обработчик пункта меню: выбрать микрофон (None — системный по умолчанию)."""
+    def action(icon, item):
+        global audio_device, audio_restart
+        if audio_device == name:
+            return
+        audio_device = name
+        audio_restart = True
+        logging.info(f"Выбран микрофон: {name or 'системный по умолчанию'}")
+        icon.update_menu()
+    return action
+
+
+def rescan_action(icon, item):
+    """Пункт «Обновить список»: перечитать устройства и переоткрыть поток."""
+    global audio_rescan, audio_restart
+    audio_rescan = True
+    audio_restart = True
+
+
+def device_items():
+    """Элементы подменю «Микрофон». Пересобираются при каждом update_menu()."""
+    yield pystray.MenuItem(f"Сейчас: {audio_device_active or 'поток не открыт'}",
+                           None, enabled=False)
+    yield pystray.Menu.SEPARATOR
+    yield pystray.MenuItem("Системный по умолчанию", pick_device(None),
+                           checked=lambda item: audio_device is None, radio=True)
+    for name in audio_devices:
+        yield pystray.MenuItem(name, pick_device(name),
+                               checked=lambda item, n=name: audio_device == n, radio=True)
+    yield pystray.Menu.SEPARATOR
+    yield pystray.MenuItem("Обновить список", rescan_action)
+
+
 def exit_action(icon, item):
     global app_running
     logging.info("Пользователь запросил выход через трей. Завершение работы...")
@@ -915,9 +1066,11 @@ try:
         pystray.MenuItem(f"{_key_for(MODE_TASK)} — задача в SingularityApp", lambda: None, enabled=False),
         pystray.MenuItem(f"{_key_for(MODE_NOTE)} — заметка в Obsidian", lambda: None, enabled=False),
         pystray.MenuItem("История…", history_action, enabled=HistoryWindow is not None),
+        pystray.MenuItem("Микрофон", pystray.Menu(device_items)),
         pystray.MenuItem("Выход", exit_action)
     )
     icon = pystray.Icon("AquaLocal", create_image(), "AquaLocal STT", menu)
+    tray_icon = icon
     icon.run_detached()
     logging.info("Иконка в трее создана.")
 except Exception as e:
