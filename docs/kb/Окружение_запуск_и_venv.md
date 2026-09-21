@@ -20,7 +20,7 @@ permalink: aqualocal/okruzhenie-zapusk-i-venv
 
 ## Что стоит на машине владельца (проверено 2026-08-13)
 
-- Репозиторий: `F:\rep\aqualocal`, venv — `F:\rep\aqualocal\.venv`, Python **3.12.10**.
+- venv — `.venv` в корне репозитория, Python **3.12.10**.
 - `ctranslate2` **4.5.0**, поддерживаемые типы на GPU: `float16`, `bfloat16`, `int8*`, `float32`.
 - GPU — **NVIDIA GeForce RTX 3060, 12 ГБ**, драйвер 561.09. В `README.md` написано «проверялось на
   RTX 3090» — это про машину автора апстрима, не про эту. Расчёты по VRAM вести от 12 ГБ:

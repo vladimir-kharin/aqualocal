@@ -1,5 +1,7 @@
 # AquaLocal
 
+> Это форк проекта [neo-flashman/aqualocal](https://github.com/neo-flashman/aqualocal) Дмитрия Волова. Что добавлено поверх оригинала: история распознаваний с аудио и повторным распознаванием, выбор микрофона из трея без перезапуска, горячие клавиши, не зависящие от раскладки, оверлей поверх всех окон, пакетное распознавание длинных диктовок (`STT_BATCH_SIZE`), локальный STT-сервер для своих скриптов (`STT_PORT`), визуальная обратная связь. Настройки — те же, через `.env`.
+
 Локальный голосовой ввод для Windows с NVIDIA GPU. Зажимаешь горячую клавишу, говоришь, отпускаешь — распознанный текст уходит в одно из трёх мест:
 
 | Клавиша | Действие | Куда |
@@ -16,7 +18,7 @@
 
 ## Демо
 
-Видео с демонстрацией работы: [YouTube](https://youtu.be/RJjDCePVZ0s) · [зеркало на Яндекс.Диске](https://disk.yandex.ru/i/apnp1_Zxa5f5Og)
+Видео с демонстрацией работы (запись автора оригинала, Дмитрия Волова): [YouTube](https://youtu.be/RJjDCePVZ0s) · [зеркало на Яндекс.Диске](https://disk.yandex.ru/i/apnp1_Zxa5f5Og)
 
 ---
 
@@ -66,7 +68,7 @@ CPU-режим технически возможен (правкой `device="cp
 ## Быстрый старт
 
 ```powershell
-git clone https://github.com/neo-flashman/aqualocal.git
+git clone https://github.com/vladimir-kharin/aqualocal.git
 cd aqualocal
 
 py -3.12 -m venv .venv

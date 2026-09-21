@@ -10,7 +10,7 @@ title: Форк, upstream и что нельзя публиковать
 - git
 статус: действует
 обновлено: 2026-08-13
-источник: git remote -v и git log в F:\rep\aqualocal, README.md; сессия Claude 2026-08-13
+источник: git remote -v и git log репозитория, README.md; сессия Claude 2026-08-13
 permalink: aqualocal/fork-upstream-i-privatnost
 ---
 
